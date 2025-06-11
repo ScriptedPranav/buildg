@@ -36,6 +36,7 @@ import (
 	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
+	containerdworker "github.com/moby/buildkit/worker/containerd"
 	"github.com/moby/buildkit/worker/runc"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -259,11 +260,35 @@ func newClient(ctx context.Context, cfg *config.Config, debugController *debugCo
 		}
 	}()
 
-	// Initialize OCI worker with debugging support
-	w, resolverFunc, err := newWorker(ctx, cfg)
+	// Initialize workers with debugging support
+	workers, resolverFunc, err := newWorkers(ctx, cfg)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Prefer the containerd worker if it was enabled, otherwise use first worker
+	var w worker.Worker
+	if cfg.Workers.Containerd.Enabled != nil && *cfg.Workers.Containerd.Enabled {
+		// Containerd is enabled, find and use the containerd worker
+		// Since we create OCI first (if enabled) then containerd, containerd will be at index 1 if both exist
+		// But if only containerd exists, it will be at index 0
+		if len(workers) == 1 {
+			// Only one worker, must be containerd since it's enabled
+			w = workers[0]
+			logrus.Infof("Using containerd worker")
+		} else if len(workers) > 1 {
+			// Multiple workers, containerd should be at index 1
+			w = workers[1]
+			logrus.Infof("Using containerd worker")
+		} else {
+			return nil, nil, fmt.Errorf("no containerd worker available despite being enabled")
+		}
+	} else {
+		// Containerd not enabled, use first available worker (should be OCI)
+		w = workers[0]
+		logrus.Infof("Using OCI worker")
+	}
+
 	if debugController != nil {
 		w = debugController.debugWorker(w)
 	}
@@ -330,11 +355,43 @@ func newClient(ctx context.Context, cfg *config.Config, debugController *debugCo
 	return c, done, nil
 }
 
-func newWorker(ctx context.Context, cfg *config.Config) (worker.Worker, docker.RegistryHosts, error) {
+func newWorkers(ctx context.Context, cfg *config.Config) ([]worker.Worker, docker.RegistryHosts, error) {
 	root := cfg.Root
 	if root == "" {
 		return nil, nil, fmt.Errorf("failed to init worker: root directory must be set")
 	}
+
+	var workers []worker.Worker
+	resolverFunc := resolver.NewRegistryConfig(cfg.Registries)
+
+	// Create OCI worker if enabled (default behavior)
+	if cfg.Workers.OCI.Enabled == nil || *cfg.Workers.OCI.Enabled {
+		ociWorker, err := newOCIWorker(ctx, cfg, root, resolverFunc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create OCI worker: %w", err)
+		}
+		workers = append(workers, ociWorker)
+		logrus.Infof("OCI worker created")
+	}
+
+	// Create containerd worker if enabled
+	if cfg.Workers.Containerd.Enabled != nil && *cfg.Workers.Containerd.Enabled {
+		containerdWorker, err := newContainerdWorker(ctx, cfg, root, resolverFunc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create containerd worker: %w", err)
+		}
+		workers = append(workers, containerdWorker)
+		logrus.Infof("containerd worker created")
+	}
+
+	if len(workers) == 0 {
+		return nil, nil, fmt.Errorf("no workers enabled")
+	}
+
+	return workers, resolverFunc, nil
+}
+
+func newOCIWorker(ctx context.Context, cfg *config.Config, root string, resolverFunc docker.RegistryHosts) (worker.Worker, error) {
 	snName := cfg.Workers.OCI.Snapshotter
 	if snName == "auto" {
 		if err := overlayutils.Supported(root); err == nil {
@@ -360,7 +417,7 @@ func newWorker(ctx context.Context, cfg *config.Config) (worker.Worker, docker.R
 			},
 		}
 	default:
-		return nil, nil, fmt.Errorf("unknown snapshotter %q", snName)
+		return nil, fmt.Errorf("unknown snapshotter %q", snName)
 	}
 	rootless := cfg.Workers.OCI.Rootless
 	nc := netproviders.Opt{
@@ -373,15 +430,58 @@ func newWorker(ctx context.Context, cfg *config.Config) (worker.Worker, docker.R
 	}
 	opt, err := runc.NewWorkerOpt(root, snFactory, rootless, oci.ProcessSandbox, nil, nil, nc, nil, "", "", false, nil, "", "", nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	resolverFunc := resolver.NewRegistryConfig(cfg.Registries)
 	opt.RegistryHosts = resolverFunc
 	w, err := base.NewWorker(ctx, opt)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return w, resolverFunc, nil
+	return w, nil
+}
+
+func newContainerdWorker(ctx context.Context, cfg *config.Config, root string, resolverFunc docker.RegistryHosts) (worker.Worker, error) {
+	address := cfg.Workers.Containerd.Address
+	if address == "" {
+		address = "unix:///var/run/containerd/containerd.sock"
+	}
+
+	logrus.Infof("Creating containerd worker with address: %s", address)
+
+	// Set up worker options for containerd
+	workerOpts := containerdworker.WorkerOptions{
+		Root:            root,
+		Address:         address,
+		SnapshotterName: cfg.Workers.Containerd.Snapshotter,
+		Namespace:       cfg.Workers.Containerd.Namespace,
+		Rootless:        cfg.Workers.Containerd.Rootless,
+		NetworkOpt: netproviders.Opt{
+			Mode: "auto", // containerd typically handles networking
+		},
+	}
+
+	if workerOpts.SnapshotterName == "" {
+		workerOpts.SnapshotterName = "overlayfs"
+	}
+
+	if workerOpts.Namespace == "" {
+		workerOpts.Namespace = "buildkit"
+	}
+
+	// Use BuildKit's actual containerd worker constructor
+	opt, err := containerdworker.NewWorkerOpt(workerOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create containerd worker options: %w", err)
+	}
+
+	opt.RegistryHosts = resolverFunc
+
+	w, err := base.NewWorker(ctx, opt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create containerd worker: %w", err)
+	}
+
+	return w, nil
 }
 
 func newPipeListener() *pipeListener {

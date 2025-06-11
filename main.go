@@ -29,6 +29,7 @@ import (
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/sys/userns"
+	"github.com/pelletier/go-toml"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -46,6 +47,10 @@ func main() {
 		cli.StringSliceFlag{
 			Name:  "root",
 			Usage: "Path to the root directory for storing data (e.g. \"/var/lib/buildg\")",
+		},
+		cli.StringFlag{
+			Name:  "config",
+			Usage: "Path to buildkitd.toml config file",
 		},
 		cli.StringFlag{
 			Name:  "oci-worker-snapshotter",
@@ -549,13 +554,41 @@ func dapDuAction(clicontext *cli.Context) error {
 
 func parseGlobalWorkerConfig(clicontext *cli.Context) (cfg *config.Config, rootDir string, err error) {
 	cfg = &config.Config{}
+
+	// Try to load config from file
+	if configPath := clicontext.GlobalString("config"); configPath != "" {
+		if err := loadConfigFromFile(cfg, configPath); err != nil {
+			return nil, "", fmt.Errorf("failed to load config from %s: %w", configPath, err)
+		}
+		logrus.Debugf("loaded config from %s", configPath)
+	} else {
+		// Try default locations if no config file specified
+		defaultPaths := getDefaultConfigPaths(userns.RunningInUserNS())
+		for _, path := range defaultPaths {
+			if _, err := os.Stat(path); err == nil {
+				if err := loadConfigFromFile(cfg, path); err != nil {
+					logrus.Warnf("failed to load config from %s: %v", path, err)
+				} else {
+					logrus.Debugf("loaded config from %s", path)
+					break
+				}
+			}
+		}
+	}
+
+	// CLI flags override config file settings
 	cfg.Workers.OCI.Rootless = userns.RunningInUserNS()
+	// Preserve the containerd worker address from config file, but allow override
+	if cfg.Workers.Containerd.Address == "" {
+		cfg.Workers.Containerd.Address = "/run/containerd/containerd.sock"
+	}
 	cfg.Workers.OCI.NetworkConfig = config.NetworkConfig{
 		Mode:          clicontext.GlobalString("oci-worker-net"),
 		CNIConfigPath: clicontext.GlobalString("oci-cni-config-path"),
 		CNIBinaryPath: clicontext.GlobalString("oci-cni-binary-path"),
 	}
 	cfg.Workers.OCI.Snapshotter = clicontext.GlobalString("oci-worker-snapshotter")
+
 	rootDir = clicontext.GlobalString("root")
 	if rootDir == "" {
 		rootDir, err = rootDataDir(cfg.Workers.OCI.Rootless)
@@ -567,6 +600,28 @@ func parseGlobalWorkerConfig(clicontext *cli.Context) (cfg *config.Config, rootD
 		}
 	}
 	return cfg, rootDir, nil
+}
+
+func getDefaultConfigPaths(rootless bool) []string {
+	if rootless {
+		home := os.Getenv("HOME")
+		if home != "" {
+			return []string{
+				filepath.Join(home, ".config/buildkit/buildkitd.toml"),
+			}
+		}
+		return []string{}
+	}
+	return []string{"/etc/buildkit/buildkitd.toml"}
+}
+
+func loadConfigFromFile(cfg *config.Config, configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+
+	return toml.Unmarshal(data, cfg)
 }
 
 // TODO:
