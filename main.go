@@ -19,6 +19,7 @@ import (
 
 	"github.com/containerd/console"
 	dockerconfig "github.com/docker/cli/cli/config"
+	"github.com/ktock/buildg/pkg"
 	"github.com/ktock/buildg/pkg/buildkit"
 	"github.com/ktock/buildg/pkg/dap"
 	"github.com/ktock/buildg/pkg/version"
@@ -307,11 +308,88 @@ func debugAction(clicontext *cli.Context) error {
 	}
 	sigHandler.start()
 
-	// Parse build options
+	// Parse build options first to get the Dockerfile path
 	solveOpt, err := parseSolveOpt(clicontext)
 	if err != nil {
 		return err
 	}
+
+	// Check if we need to preprocess the Dockerfile for local images
+	var preprocessor *pkg.DockerfileProcessor
+	var processingResult *pkg.ProcessingResult
+	var dockerfilePath string
+
+	// Determine Dockerfile path
+	if filename := clicontext.String("file"); filename != "" {
+		dockerfilePath = filename
+	} else {
+		// Default Dockerfile location
+		buildContext := clicontext.Args().First()
+		if buildContext == "" {
+			buildContext = "."
+		}
+		dockerfilePath = filepath.Join(buildContext, "Dockerfile")
+	}
+
+	// Check if Dockerfile exists
+	if _, err := os.Stat(dockerfilePath); err == nil {
+		// Initialize preprocessor
+		preprocessor, err = pkg.NewDockerfileProcessor()
+		if err != nil {
+			logrus.Warnf("Failed to initialize Dockerfile preprocessor: %v", err)
+			logrus.Info("Continuing without preprocessing...")
+		} else {
+			logrus.Info("Preprocessing Dockerfile for local images...")
+			processingResult, err = preprocessor.Process(dockerfilePath)
+			if err != nil {
+				logrus.Errorf("Failed to preprocess Dockerfile: %v", err)
+				preprocessor.Cleanup()
+				return err
+			}
+
+			// If images were processed, update the Dockerfile path in solveOpt
+			if len(processingResult.ProcessedImages) > 0 {
+				logrus.Infof("Processed %d local images, using modified Dockerfile: %s",
+					len(processingResult.ProcessedImages), processingResult.ModifiedDockerfilePath)
+
+				// Update the dockerfile path in localDirs
+				dir, file := filepath.Split(processingResult.ModifiedDockerfilePath)
+				if dir != "" {
+					solveOpt.LocalDirs["dockerfile"] = dir
+				}
+				// Update the filename in frontend attributes
+				if solveOpt.FrontendAttrs == nil {
+					solveOpt.FrontendAttrs = make(map[string]string)
+				}
+				solveOpt.FrontendAttrs["filename"] = file
+			} else {
+				logrus.Info("No local images found to process, continuing with original Dockerfile")
+				// Clean up since we didn't need preprocessing
+				preprocessor.Cleanup()
+				preprocessor = nil
+				processingResult = nil
+			}
+		}
+	}
+
+	// Set up cleanup to run on exit
+	defer func() {
+		if preprocessor != nil {
+			if err := preprocessor.Cleanup(); err != nil {
+				logrus.Errorf("Failed to cleanup preprocessor: %v", err)
+			}
+
+			// Remove modified Dockerfile
+			if processingResult != nil && processingResult.ModifiedDockerfilePath != "" {
+				if err := os.Remove(processingResult.ModifiedDockerfilePath); err != nil {
+					logrus.Debugf("Failed to remove modified Dockerfile %s: %v",
+						processingResult.ModifiedDockerfilePath, err)
+				} else {
+					logrus.Debugf("Removed modified Dockerfile: %s", processingResult.ModifiedDockerfilePath)
+				}
+			}
+		}
+	}()
 
 	// Parse config options
 	cfg, rootDir, err := parseGlobalWorkerConfig(clicontext)
