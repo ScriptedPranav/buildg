@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
+	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -131,7 +131,7 @@ func (dp *DockerfileProcessor) startLocalRegistry() (string, error) {
 	ctx := context.Background()
 
 	// Pull registry image if not exists
-	reader, err := dp.dockerClient.ImagePull(ctx, "registry:2", image.PullOptions{})
+	reader, err := dp.dockerClient.ImagePull(ctx, "registry:2", imagetypes.PullOptions{})
 	if err != nil {
 		return "", fmt.Errorf("failed to pull registry image: %w", err)
 	}
@@ -354,35 +354,88 @@ func (dp *DockerfileProcessor) checkImagesExist(images []ImageRef) ([]ImageRef, 
 
 func (dp *DockerfileProcessor) tagAndPushImages(images []ImageRef) ([]string, error) {
 	ctx := context.Background()
-	var processedImages []string
 
-	for _, img := range images {
-		localRegistryTag := fmt.Sprintf("localhost:%d/%s", dp.registryPort, img.Original)
-
-		// Tag image for local registry
-		if err := dp.dockerClient.ImageTag(ctx, img.Original, localRegistryTag); err != nil {
-			return nil, fmt.Errorf("failed to tag image %s: %w", img.Original, err)
-		}
-
-		// Push image to local registry
-		pushReader, err := dp.dockerClient.ImagePush(ctx, localRegistryTag, image.PushOptions{
-			RegistryAuth: "e30K", // Empty JSON object base64 encoded: "{}"
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to push image %s: %w", localRegistryTag, err)
-		}
-
-		// Read push response to completion
-		_, err = io.Copy(io.Discard, pushReader)
-		pushReader.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read push response for %s: %w", localRegistryTag, err)
-		}
-
-		processedImages = append(processedImages, img.Original)
-		logrus.Infof("Successfully tagged and pushed %s as %s", img.Original, localRegistryTag)
+	if len(images) == 0 {
+		return []string{}, nil
 	}
 
+	// Use channels to coordinate goroutines
+	type pushResult struct {
+		imageName string
+		error     error
+	}
+
+	resultChan := make(chan pushResult, len(images))
+
+	// Determine the level of parallelism
+	// Use min(numImages, 3) to avoid overwhelming the registry while still getting speed benefits
+	maxWorkers := len(images)
+	if maxWorkers > 3 {
+		maxWorkers = 3
+	}
+
+	// Create a buffered channel to limit concurrent operations
+	semaphore := make(chan struct{}, maxWorkers)
+
+	logrus.Infof("Starting parallel push of %d images with %d workers", len(images), maxWorkers)
+
+	// Start goroutines for each image
+	for _, img := range images {
+		go func(image ImageRef) {
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			localRegistryTag := fmt.Sprintf("localhost:%d/%s", dp.registryPort, image.Original)
+
+			// Tag image for local registry
+			if err := dp.dockerClient.ImageTag(ctx, image.Original, localRegistryTag); err != nil {
+				resultChan <- pushResult{image.Original, fmt.Errorf("failed to tag image %s: %w", image.Original, err)}
+				return
+			}
+
+			// Push image to local registry
+			pushOptions := imagetypes.PushOptions{
+				RegistryAuth: "e30K", // Empty JSON object base64 encoded: "{}"
+			}
+			pushReader, err := dp.dockerClient.ImagePush(ctx, localRegistryTag, pushOptions)
+			if err != nil {
+				resultChan <- pushResult{image.Original, fmt.Errorf("failed to push image %s: %w", localRegistryTag, err)}
+				return
+			}
+
+			// Read push response to completion
+			_, err = io.Copy(io.Discard, pushReader)
+			pushReader.Close()
+			if err != nil {
+				resultChan <- pushResult{image.Original, fmt.Errorf("failed to read push response for %s: %w", localRegistryTag, err)}
+				return
+			}
+
+			logrus.Infof("Successfully tagged and pushed %s as %s", image.Original, localRegistryTag)
+			resultChan <- pushResult{image.Original, nil}
+		}(img)
+	}
+
+	// Collect results
+	var processedImages []string
+	var errors []string
+
+	for i := 0; i < len(images); i++ {
+		result := <-resultChan
+		if result.error != nil {
+			errors = append(errors, result.error.Error())
+		} else {
+			processedImages = append(processedImages, result.imageName)
+		}
+	}
+
+	// Return first error if any occurred
+	if len(errors) > 0 {
+		return nil, fmt.Errorf("failed to process images: %s", strings.Join(errors, "; "))
+	}
+
+	logrus.Infof("Successfully processed %d images in parallel", len(processedImages))
 	return processedImages, nil
 }
 
@@ -518,13 +571,13 @@ func (dp *DockerfileProcessor) Cleanup() error {
 	}
 
 	// Remove any tagged images for local registry
-	images, err := dp.dockerClient.ImageList(ctx, image.ListOptions{})
+	images, err := dp.dockerClient.ImageList(ctx, imagetypes.ListOptions{})
 	if err == nil && dp.registryPort != 0 {
 		registryPrefix := fmt.Sprintf("localhost:%d/", dp.registryPort)
 		for _, img := range images {
 			for _, tag := range img.RepoTags {
 				if strings.HasPrefix(tag, registryPrefix) {
-					if _, err := dp.dockerClient.ImageRemove(ctx, tag, image.RemoveOptions{}); err != nil {
+					if _, err := dp.dockerClient.ImageRemove(ctx, tag, imagetypes.RemoveOptions{}); err != nil {
 						logrus.Debugf("Failed to remove tagged image %s: %v", tag, err)
 					} else {
 						logrus.Debugf("Removed tagged image %s", tag)
