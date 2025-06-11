@@ -73,6 +73,15 @@ func main() {
 			EnvVar: "BUILDG_ROOTLESSKIT_ARGS",
 			Value:  "",
 		},
+		cli.StringFlag{
+			Name:   "docker-host",
+			Usage:  "Docker daemon socket path for local image fallback (e.g. \"unix:///var/run/docker.sock\")",
+			EnvVar: "DOCKER_HOST",
+		},
+		cli.BoolFlag{
+			Name:  "no-docker-fallback",
+			Usage: "Disable fallback to Docker daemon for local images",
+		},
 	}, flags...)
 	app.Commands = []cli.Command{
 		newDebugCommand(),
@@ -371,7 +380,7 @@ func debugAction(clicontext *cli.Context) error {
 	if _, err := bp.Add("on-fail", buildkit.NewOnFailBreakpoint()); err != nil {
 		return err
 	}
-	return buildkit.Debug(ctx, cfg, solveOpt, progressWriter, buildkit.DebugConfig{
+	return buildkit.DebugWithDockerFallback(ctx, cfg, solveOpt, progressWriter, buildkit.DebugConfig{
 		BreakpointHandler: func(ctx context.Context, bCtx buildkit.BreakContext) error {
 			progressWriter.disable()
 			defer progressWriter.enable()
@@ -413,7 +422,7 @@ func pruneAction(clicontext *cli.Context) error {
 		return fmt.Errorf("failed to acquire lock on the root dir; other buildg instance is running?")
 	}
 	cfg.Root = serveRoot
-	return buildkit.Prune(ctx, cfg, clicontext.Bool("all"), os.Stdout)
+	return buildkit.Prune(ctx, cfg.Config, clicontext.Bool("all"), os.Stdout)
 }
 
 func duAction(clicontext *cli.Context) error {
@@ -444,7 +453,7 @@ func duAction(clicontext *cli.Context) error {
 		return fmt.Errorf("failed to acquire lock on the root dir; other buildg instance is running?")
 	}
 	cfg.Root = serveRoot
-	return buildkit.Du(ctx, cfg, os.Stdout)
+	return buildkit.Du(ctx, cfg.Config, os.Stdout)
 }
 
 func dapServeAction(clicontext *cli.Context) error {
@@ -485,7 +494,7 @@ func dapServeAction(clicontext *cli.Context) error {
 		}
 	}
 	cfg.Root = serveRoot
-	s, err := dap.NewServer(&stdioConn{os.Stdin, os.Stdout}, cfg, cleanupFunc, cleanupAll)
+	s, err := dap.NewServer(&stdioConn{os.Stdin, os.Stdout}, cfg.Config, cleanupFunc, cleanupAll)
 	if err != nil {
 		return err
 	}
@@ -523,7 +532,7 @@ func dapPruneAction(clicontext *cli.Context) error {
 		return fmt.Errorf("failed to acquire lock on the root dir; other buildg dap session is running?")
 	}
 	cfg.Root = serveRoot
-	return buildkit.Prune(context.TODO(), cfg, clicontext.Bool("all"), os.Stdout)
+	return buildkit.Prune(context.TODO(), cfg.Config, clicontext.Bool("all"), os.Stdout)
 }
 
 func dapDuAction(clicontext *cli.Context) error {
@@ -544,21 +553,38 @@ func dapDuAction(clicontext *cli.Context) error {
 		return fmt.Errorf("failed to acquire lock on the root dir; other buildg dap session is running?")
 	}
 	cfg.Root = serveRoot
-	return buildkit.Du(context.TODO(), cfg, os.Stdout)
+	return buildkit.Du(context.TODO(), cfg.Config, os.Stdout)
 }
 
-func parseGlobalWorkerConfig(clicontext *cli.Context) (cfg *config.Config, rootDir string, err error) {
-	cfg = &config.Config{}
-	cfg.Workers.OCI.Rootless = userns.RunningInUserNS()
-	cfg.Workers.OCI.NetworkConfig = config.NetworkConfig{
+type BuildgConfig struct {
+	*config.Config
+	DockerHost            string
+	DisableDockerFallback bool
+}
+
+func (c *BuildgConfig) GetConfig() *config.Config {
+	return c.Config
+}
+
+func parseGlobalWorkerConfig(clicontext *cli.Context) (cfg *BuildgConfig, rootDir string, err error) {
+	baseCfg := &config.Config{}
+	baseCfg.Workers.OCI.Rootless = userns.RunningInUserNS()
+	baseCfg.Workers.OCI.NetworkConfig = config.NetworkConfig{
 		Mode:          clicontext.GlobalString("oci-worker-net"),
 		CNIConfigPath: clicontext.GlobalString("oci-cni-config-path"),
 		CNIBinaryPath: clicontext.GlobalString("oci-cni-binary-path"),
 	}
-	cfg.Workers.OCI.Snapshotter = clicontext.GlobalString("oci-worker-snapshotter")
+	baseCfg.Workers.OCI.Snapshotter = clicontext.GlobalString("oci-worker-snapshotter")
+
+	cfg = &BuildgConfig{
+		Config:                baseCfg,
+		DockerHost:            clicontext.GlobalString("docker-host"),
+		DisableDockerFallback: clicontext.GlobalBool("no-docker-fallback"),
+	}
+
 	rootDir = clicontext.GlobalString("root")
 	if rootDir == "" {
-		rootDir, err = rootDataDir(cfg.Workers.OCI.Rootless)
+		rootDir, err = rootDataDir(baseCfg.Workers.OCI.Rootless)
 		if err != nil {
 			return nil, "", err
 		}
@@ -610,6 +636,7 @@ func parseSolveOpt(clicontext *cli.Context) (*client.SolveOpt, error) {
 	attachable := []session.Attachable{
 		authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{
 			ConfigFile: dockerconfig.LoadDefaultConfigFile(os.Stderr)})}
+
 	if ssh := clicontext.StringSlice("ssh"); len(ssh) > 0 {
 		configs, err := build.ParseSSH(ssh)
 		if err != nil {
