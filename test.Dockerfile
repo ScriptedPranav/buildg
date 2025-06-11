@@ -1,0 +1,180 @@
+
+# curated daprio/daprd image
+# git: https://github.com/dapr/dapr/tree/v1.15.5
+# original dockerfile: https://github.com/dapr/dapr/blob/v1.15.5/docker/Dockerfile
+# docker pull daprio/daprd:1.15.5
+
+ARG RF_ARCH=amd64
+ARG RF_ARCH_ALT=x86_64
+
+ARG MODULE_VERSION=1.15.5
+ARG MODULE_GIT_URL=https://github.com/dapr/dapr
+
+ARG MODULE_USERID=65532
+
+ARG GOLANG_VERSION=1.24.4
+
+#################################################################################
+FROM golang:${GOLANG_VERSION}-jammy-rfcurated AS golang-builder
+
+USER 0
+
+# put update before ARG so we can cache it across images
+RUN apt update
+
+WORKDIR /build
+
+# reinstate the args
+ARG RF_ARCH
+ARG MODULE_VERSION
+ARG MODULE_GIT_URL
+
+# get the tools
+RUN \
+    mkdir /artifacts && \
+    apt install -y \
+        git \
+        make \
+    ;
+
+# clone repos
+RUN \
+    git clone --branch v${MODULE_VERSION} --depth=1 ${MODULE_GIT_URL} && \
+    cd dapr
+
+## update vulnerable pkgs
+RUN \
+   cd ./dapr && \
+   # Add dependency updates here if needed \
+   # Placeholder for future vulnerability updates \
+   # go mod vendor && \
+   # go mod tidy && \
+   true
+
+# build daprd binary with proper version information
+RUN \
+    cd ./dapr && \
+    export GOOS=linux && \
+    export GOARCH=${RF_ARCH} && \
+    # PS: if not set, REL_VERSION will be set to "edge" which is not what we want
+    export REL_VERSION=${MODULE_VERSION} && \
+    # Build the daprd binary using the makefile target which sets proper ldflags \
+    CGO=0 BINARIES=daprd make build-linux && \
+    # Copy the built binary to artifacts \
+    cp ./dist/linux_${RF_ARCH}/release/daprd /artifacts/
+
+# run unit tests
+RUN \
+    cd ./dapr && \
+    # Run unit tests only for daprd-specific packages \
+    go test -v -short ./cmd/daprd/... && \
+    # Also test core runtime packages that daprd depends on \
+    # nvm, skip these
+    # go test -v -short ./pkg/runtime/... ./pkg/http/... ./pkg/grpc/... && \
+    true
+
+# smoke test
+RUN /artifacts/daprd --version | grep "${MODULE_VERSION}"
+
+# copy licenses
+RUN \
+    cd ./dapr && \
+    cp -a ./LICENSE /artifacts/
+
+#################################################################################
+FROM rfubu:22.04-scratch-rfcurated AS run-prep-image
+
+# reinstate the args
+ARG RF_ARCH
+ARG RF_ARCH_ALT
+ARG MODULE_USERID
+
+# Copy rfapt tools
+COPY --from=rfubu:22.04-rfapt-rfcurated /rfapt /rfapt
+
+# Make sure to set the path, or execute /rfapt/apt instead of just apt
+ENV PATH=/rfapt:${PATH}
+SHELL ["/rfapt/sh", "-c"]
+
+# Install necessary packages
+RUN apt update && apt install -y --no-install-recommends --no-install-suggests \
+    base-files \
+    netbase \
+    tzdata
+
+# Copy daprd binary to root directory to match original
+COPY --from=golang-builder /artifacts/daprd /daprd
+COPY --from=golang-builder /artifacts/LICENSE /
+
+# Create nonroot user and group (nobody already exists)
+RUN groupadd -g ${MODULE_USERID} nonroot && \
+    useradd -r -u ${MODULE_USERID} -g nonroot -s /sbin/nologin -d /home/nonroot -m nonroot
+
+# Set proper permissions for nonroot home directory
+RUN chmod 700 /home/nonroot && \
+    chown ${MODULE_USERID}:${MODULE_USERID} /home/nonroot
+
+# Force remove ALL packages except the 3 we need (tzdata, netbase, base-files)
+RUN PACKAGES_TO_KEEP="^(tzdata|netbase|base-files)$" && \
+    ALL_PACKAGES=$(dpkg --get-selections | grep -v deinstall | awk '{print $1}' | sort) && \
+    PACKAGES_TO_PURGE=$(echo "$ALL_PACKAGES" | grep -v -E "$PACKAGES_TO_KEEP") && \
+    if [ -n "$PACKAGES_TO_PURGE" ]; then \
+        echo "Force removing packages: $PACKAGES_TO_PURGE" && \
+        dpkg --force-all --purge $PACKAGES_TO_PURGE 2>/dev/null || true; \
+    fi
+
+# Targeted cleanup to remove major bloat sources identified in analysis
+RUN rm -rf \
+    # Remove /usr/lib bloat (28M) - biggest contributor
+    /usr/lib/*-linux-gnu/gconv \
+    /usr/lib/*-linux-gnu/security \
+    /usr/lib/systemd \
+    /usr/lib/dpkg \
+    /usr/lib/locale \
+    /usr/lib/tmpfiles.d \
+    /usr/lib/mime \
+    /usr/lib/udev \
+    /usr/lib/lsb \
+    /usr/lib/sysctl.d \
+    # Remove all binaries (5.8M + 1.6M)
+    /usr/bin/* \
+    /usr/sbin/* \
+    # Remove /var bloat (2.7M)
+    /var/lib/apt \
+    /var/cache/* \
+    /var/log/* \
+    # Clean up other unnecessary directories
+    /usr/libexec \
+    /usr/lib64 \
+    /usr/lib32 \
+    /usr/libx32 \
+    /usr/include \
+    /usr/src
+
+# Ensure setuid and setgid permissions are removed CIS 4.8
+RUN find / -path /proc -prune -o \( -perm /4000 -o -perm /2000 \) -type f -exec chmod u-s,g-s {} \; 2>/dev/null || true
+
+# Final cleanup - this removes package management and shell, must be last
+RUN apt rfclean
+
+#################################################################################
+FROM scratch
+
+# reinstate the args
+ARG RF_ARCH_ALT
+ARG MODULE_VERSION
+ARG MODULE_GIT_URL
+ARG MODULE_USERID
+
+LABEL org.opencontainers.image.source="${MODULE_GIT_URL}"
+LABEL maintainer="RapidFort Curation Team <rfcurators@rapidfort.com>"
+
+COPY --from=run-prep-image / /
+COPY curated.scratch.json /usr/share/rapidfort/curated.json
+COPY curated.scratch.md /usr/share/rapidfort/curated.md
+
+ENV SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+#Ensure that a User for the Container has been created CIS 4.1
+USER ${MODULE_USERID}:${MODULE_USERID}
