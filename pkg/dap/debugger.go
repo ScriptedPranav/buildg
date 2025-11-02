@@ -112,6 +112,7 @@ func parseDAPSolveOpt(cfg LaunchConfig) (*client.SolveOpt, error) {
 		optStr = append(optStr, "build-arg:"+ba)
 	}
     // Prefer resolving base images from local image store first
+    optStr = append(optStr, "image-resolve-mode=local")
     optStr = append(optStr, "image.resolvemode=local")
 	frontendAttrs, err := build.ParseOpt(optStr)
 	if err != nil {

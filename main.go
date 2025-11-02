@@ -19,6 +19,7 @@ import (
 
 	"github.com/containerd/console"
 	ctrimages "github.com/containerd/containerd/v2/core/images"
+	ctrdlog "github.com/containerd/log"
 	distreference "github.com/distribution/reference"
 	dockerconfig "github.com/docker/cli/cli/config"
 	"github.com/ktock/buildg/pkg/buildkit"
@@ -89,6 +90,10 @@ func main() {
 		logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 		if context.GlobalBool("debug") {
 			logrus.SetLevel(logrus.DebugLevel)
+			ctrdlog.SetLevel("debug")
+		} else {
+			// Reduce noise from containerd resolver (e.g., transient pull access errors) when local resolution succeeds.
+			ctrdlog.SetLevel("warn")
 		}
 		if os.Geteuid() != 0 {
 			// Running by nonroot user. Enter to the rootless mode.
@@ -682,6 +687,8 @@ func parseSolveOpt(clicontext *cli.Context) (*client.SolveOpt, error) {
 		optStr = append(optStr, "build-arg:"+ba)
 	}
 	// Prefer resolving base images from local image store first to avoid registry lookups
+	// Both legacy (dash) and newer (dot) keys are set for compatibility with frontends.
+	optStr = append(optStr, "image-resolve-mode=local")
 	optStr = append(optStr, "image.resolvemode=local")
 	frontendAttrs, err := build.ParseOpt(optStr)
 	if err != nil {
