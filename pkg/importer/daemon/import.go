@@ -20,11 +20,11 @@ import (
 
 // ImportImage streams an image that exists in the local Docker daemon into the
 // provided content store. Layers are deduplicated by digest; existing content
-// is skipped. On success, the returned digest is the manifest digest of the
+// is skipped. On success, the returned descriptor points to the manifest of the
 // imported image.
-func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, ref string) (digest.Digest, error) {
+func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, ref string) (ocispec.Descriptor, error) {
 	if strings.TrimSpace(ref) == "" {
-		return "", fmt.Errorf("image reference must be specified")
+		return ocispec.Descriptor{}, fmt.Errorf("image reference must be specified")
 	}
 	// Ensure content is pinned by a lease so GC won't drop it.
 	lease, err := lm.Create(ctx, leases.WithRandomID())
@@ -35,21 +35,21 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 	// Resolve image from Docker daemon.
 	parsed, err := name.ParseReference(ref)
 	if err != nil {
-		return "", err
+		return ocispec.Descriptor{}, err
 	}
 	img, err := crdaemon.Image(parsed)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve image from docker daemon: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("failed to resolve image from docker daemon: %w", err)
 	}
 
 	// Write config blob
 	rcfg, err := img.RawConfigFile()
 	if err != nil {
-		return "", err
+		return ocispec.Descriptor{}, err
 	}
 	cfgHash, err := img.ConfigName()
 	if err != nil {
-		return "", err
+		return ocispec.Descriptor{}, err
 	}
 	cfgDesc := ocispec.Descriptor{
 		MediaType: string(crtypes.OCIConfigJSON),
@@ -57,31 +57,31 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 		Size:      int64(len(rcfg)),
 	}
 	if err := writeBytesIfMissing(ctx, store, cfgDesc, rcfg); err != nil {
-		return "", fmt.Errorf("config ingest failed: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("config ingest failed: %w", err)
 	}
 
 	// Write layers (compressed)
 	layers, err := img.Layers()
 	if err != nil {
-		return "", err
+		return ocispec.Descriptor{}, err
 	}
 	var layerDescs []ocispec.Descriptor
 	for i, l := range layers {
 		d, err := l.Digest()
 		if err != nil {
-			return "", err
+			return ocispec.Descriptor{}, err
 		}
 		sz, err := l.Size()
 		if err != nil {
-			return "", err
+			return ocispec.Descriptor{}, err
 		}
 		mt, err := l.MediaType()
 		if err != nil {
-			return "", err
+			return ocispec.Descriptor{}, err
 		}
 		desc := ocispec.Descriptor{MediaType: string(mt), Digest: digest.Digest(d.String()), Size: sz}
 		if err := writeLayerIfMissing(ctx, store, desc, l); err != nil {
-			return "", fmt.Errorf("layer %d ingest failed: %w", i, err)
+			return ocispec.Descriptor{}, fmt.Errorf("layer %d ingest failed: %w", i, err)
 		}
 		layerDescs = append(layerDescs, desc)
 	}
@@ -89,11 +89,11 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 	// Write manifest
 	rm, err := img.RawManifest()
 	if err != nil {
-		return "", err
+		return ocispec.Descriptor{}, err
 	}
 	md, err := img.Digest()
 	if err != nil {
-		return "", err
+		return ocispec.Descriptor{}, err
 	}
 	manifestDesc := ocispec.Descriptor{
 		MediaType: string(crtypes.OCIManifestSchema1),
@@ -101,10 +101,10 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 		Size:      int64(len(rm)),
 	}
 	if err := writeBytesIfMissing(ctx, store, manifestDesc, rm); err != nil {
-		return "", fmt.Errorf("manifest ingest failed: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("manifest ingest failed: %w", err)
 	}
 
-	return manifestDesc.Digest, nil
+	return manifestDesc, nil
 }
 
 func writeBytesIfMissing(ctx context.Context, store content.Store, desc ocispec.Descriptor, b []byte) error {

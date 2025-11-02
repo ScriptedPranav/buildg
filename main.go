@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/containerd/console"
+	ctrimages "github.com/containerd/containerd/v2/core/images"
+	distreference "github.com/distribution/reference"
 	dockerconfig "github.com/docker/cli/cli/config"
 	"github.com/ktock/buildg/pkg/buildkit"
 	"github.com/ktock/buildg/pkg/dap"
@@ -300,61 +302,81 @@ func newDapDuCommand() cli.Command {
 }
 
 func newImageCommand() cli.Command {
-    return cli.Command{
-        Name:  "image",
-        Usage: "Image utilities",
-        Subcommands: []cli.Command{
-            newImageImportCommand(),
-        },
-    }
+	return cli.Command{
+		Name:  "image",
+		Usage: "Image utilities",
+		Subcommands: []cli.Command{
+			newImageImportCommand(),
+		},
+	}
 }
 
 func newImageImportCommand() cli.Command {
-    return cli.Command{
-        Name:      "import",
-        Usage:     "Import an image from Docker daemon into buildg cache (no registry)",
-        UsageText: "image import <ref>",
-        Action:    imageImportAction,
-    }
+	return cli.Command{
+		Name:      "import",
+		Usage:     "Import an image from Docker daemon into buildg cache (no registry)",
+		UsageText: "image import <ref>",
+		Action:    imageImportAction,
+	}
 }
 
 func imageImportAction(clicontext *cli.Context) error {
-    ref := clicontext.Args().First()
-    if ref == "" {
-        return fmt.Errorf("image reference must be specified")
-    }
-    ctx, ctxCancel := context.WithCancel(context.Background())
-    defer ctxCancel()
+	ref := clicontext.Args().First()
+	if ref == "" {
+		return fmt.Errorf("image reference must be specified")
+	}
+	ctx, ctxCancel := context.WithCancel(context.Background())
+	defer ctxCancel()
 
-    // Parse config options and select the shared cache root used by du/prune.
-    cfg, rootDir, err := parseGlobalWorkerConfig(clicontext)
-    if err != nil {
-        return err
-    }
-    serveRoot := defaultServeRootDir(rootDir)
-    if err := os.MkdirAll(serveRoot, 0700); err != nil {
-        return err
-    }
-    ok, unlock, err := tryLockOnBuildKitRootDir(serveRoot)
-    if err != nil {
-        return err
-    } else if ok {
-        defer unlock()
-    } else {
-        return fmt.Errorf("failed to acquire lock on the root dir; other buildg instance is running?")
-    }
-    cfg.Root = serveRoot
+	// Parse config options and select the shared cache root used by du/prune.
+	cfg, rootDir, err := parseGlobalWorkerConfig(clicontext)
+	if err != nil {
+		return err
+	}
+	serveRoot := defaultServeRootDir(rootDir)
+	if err := os.MkdirAll(serveRoot, 0700); err != nil {
+		return err
+	}
+	ok, unlock, err := tryLockOnBuildKitRootDir(serveRoot)
+	if err != nil {
+		return err
+	} else if ok {
+		defer unlock()
+	} else {
+		return fmt.Errorf("failed to acquire lock on the root dir; other buildg instance is running?")
+	}
+	cfg.Root = serveRoot
 
-    store, lm, _, err := buildkit.OpenStores(ctx, cfg)
-    if err != nil {
-        return err
-    }
-    dgst, err := importerdaemon.ImportImage(ctx, store, lm, ref)
-    if err != nil {
-        return err
-    }
-    fmt.Fprintf(os.Stdout, "imported %s as %s\n", ref, dgst.String())
-    return nil
+	store, lm, _, err := buildkit.OpenStores(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	manifestDesc, err := importerdaemon.ImportImage(ctx, store, lm, ref)
+	if err != nil {
+		return err
+	}
+	// Register the image name -> manifest mapping in the local image store
+	is, err := buildkit.OpenImageStore(cfg)
+	if err != nil {
+		return err
+	}
+	if _, err := is.Create(ctx, ctrimages.Image{Name: ref, Target: manifestDesc}); err != nil {
+		if _, uErr := is.Update(ctx, ctrimages.Image{Name: ref, Target: manifestDesc}); uErr != nil {
+			// ignore if we cannot update original form
+		}
+	}
+	if named, nerr := distreference.ParseNormalizedNamed(ref); nerr == nil {
+		normalized := named.String()
+		if normalized != ref {
+			if _, err := is.Create(ctx, ctrimages.Image{Name: normalized, Target: manifestDesc}); err != nil {
+				if _, uErr := is.Update(ctx, ctrimages.Image{Name: normalized, Target: manifestDesc}); uErr != nil {
+					// ignore
+				}
+			}
+		}
+	}
+	fmt.Fprintf(os.Stdout, "imported %s as %s\n", ref, manifestDesc.Digest.String())
+	return nil
 }
 
 func debugAction(clicontext *cli.Context) error {
@@ -659,6 +681,8 @@ func parseSolveOpt(clicontext *cli.Context) (*client.SolveOpt, error) {
 	for _, ba := range clicontext.StringSlice("build-arg") {
 		optStr = append(optStr, "build-arg:"+ba)
 	}
+	// Prefer resolving base images from local image store first to avoid registry lookups
+	optStr = append(optStr, "image.resolvemode=local")
 	frontendAttrs, err := build.ParseOpt(optStr)
 	if err != nil {
 		return nil, err

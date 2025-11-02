@@ -104,13 +104,15 @@ func parseDAPSolveOpt(cfg LaunchConfig) (*client.SolveOpt, error) {
 	if err != nil {
 		return nil, err
 	}
-	optStr = append(optStr, "filename="+file)
+    optStr = append(optStr, "filename="+file)
 	if target := cfg.Target; target != "" {
 		optStr = append(optStr, "target="+target)
 	}
-	for _, ba := range cfg.BuildArgs {
+    for _, ba := range cfg.BuildArgs {
 		optStr = append(optStr, "build-arg:"+ba)
 	}
+    // Prefer resolving base images from local image store first
+    optStr = append(optStr, "image.resolvemode=local")
 	frontendAttrs, err := build.ParseOpt(optStr)
 	if err != nil {
 		return nil, err
