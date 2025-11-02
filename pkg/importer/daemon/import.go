@@ -52,7 +52,7 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 		return "", err
 	}
 	cfgDesc := ocispec.Descriptor{
-		MediaType: string(crtypes.OCIManifestSchema1Config),
+		MediaType: string(crtypes.OCIConfigJSON),
 		Digest:    digest.Digest(cfgHash.String()),
 		Size:      int64(len(rcfg)),
 	}
