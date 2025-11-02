@@ -21,6 +21,7 @@ import (
 	dockerconfig "github.com/docker/cli/cli/config"
 	"github.com/ktock/buildg/pkg/buildkit"
 	"github.com/ktock/buildg/pkg/dap"
+	importerdaemon "github.com/ktock/buildg/pkg/importer/daemon"
 	"github.com/ktock/buildg/pkg/version"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/cmd/buildctl/build"
@@ -79,6 +80,7 @@ func main() {
 		newDuCommand(),
 		newPruneCommand(),
 		newDapCommand(),
+		newImageCommand(),
 		newVersionCommand(),
 	}
 	app.Before = func(context *cli.Context) error {
@@ -295,6 +297,64 @@ func newDapDuCommand() cli.Command {
 		Usage:  "show disk usage of DAP cache",
 		Action: dapDuAction,
 	}
+}
+
+func newImageCommand() cli.Command {
+    return cli.Command{
+        Name:  "image",
+        Usage: "Image utilities",
+        Subcommands: []cli.Command{
+            newImageImportCommand(),
+        },
+    }
+}
+
+func newImageImportCommand() cli.Command {
+    return cli.Command{
+        Name:      "import",
+        Usage:     "Import an image from Docker daemon into buildg cache (no registry)",
+        UsageText: "image import <ref>",
+        Action:    imageImportAction,
+    }
+}
+
+func imageImportAction(clicontext *cli.Context) error {
+    ref := clicontext.Args().First()
+    if ref == "" {
+        return fmt.Errorf("image reference must be specified")
+    }
+    ctx, ctxCancel := context.WithCancel(context.Background())
+    defer ctxCancel()
+
+    // Parse config options and select the shared cache root used by du/prune.
+    cfg, rootDir, err := parseGlobalWorkerConfig(clicontext)
+    if err != nil {
+        return err
+    }
+    serveRoot := defaultServeRootDir(rootDir)
+    if err := os.MkdirAll(serveRoot, 0700); err != nil {
+        return err
+    }
+    ok, unlock, err := tryLockOnBuildKitRootDir(serveRoot)
+    if err != nil {
+        return err
+    } else if ok {
+        defer unlock()
+    } else {
+        return fmt.Errorf("failed to acquire lock on the root dir; other buildg instance is running?")
+    }
+    cfg.Root = serveRoot
+
+    store, lm, _, err := buildkit.OpenStores(ctx, cfg)
+    if err != nil {
+        return err
+    }
+    dgst, err := importerdaemon.ImportImage(ctx, store, lm, ref)
+    if err != nil {
+        return err
+    }
+    fmt.Fprintf(os.Stdout, "imported %s as %s\n", ref, dgst.String())
+    return nil
 }
 
 func debugAction(clicontext *cli.Context) error {

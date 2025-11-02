@@ -10,6 +10,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	ctdsnapshots "github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/plugins/snapshots/native"
@@ -382,6 +384,17 @@ func newWorker(ctx context.Context, cfg *config.Config) (worker.Worker, docker.R
 		return nil, nil, err
 	}
 	return w, resolverFunc, nil
+}
+
+// OpenStores returns the content store and lease manager backed by the
+// embedded worker for the provided config. The returned close function is a
+// no-op placeholder to match other open helpers.
+func OpenStores(ctx context.Context, cfg *config.Config) (content.Store, leases.Manager, func(), error) {
+	w, _, err := newWorker(ctx, cfg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return w.ContentStore(), w.LeaseManager(), func() {}, nil
 }
 
 func newPipeListener() *pipeListener {
