@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -24,7 +25,8 @@ import (
 // provided content store. Layers are deduplicated by digest; existing content
 // is skipped. On success, the returned descriptor points to the manifest of the
 // imported image.
-func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, ref string) (ocispec.Descriptor, error) {
+// layerWorkers controls concurrency for layer imports. 1 means sequential.
+func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, ref string, layerWorkers int) (ocispec.Descriptor, error) {
 	if strings.TrimSpace(ref) == "" {
 		return ocispec.Descriptor{}, fmt.Errorf("image reference must be specified")
 	}
@@ -67,10 +69,13 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	// Preallocate to avoid re-allocations while appending
-	layerDescs := make([]ocispec.Descriptor, 0, len(layers))
-	// Reusable buffer for streaming compressed layers to reduce syscall overhead
-	copyBuf := make([]byte, 4<<20) // 4 MiB
+	// Prepare tasks: compute descriptors up-front
+	type task struct {
+		index int
+		desc  ocispec.Descriptor
+		layer v1.Layer
+	}
+	var tasks []task
 	for i, l := range layers {
 		d, err := l.Digest()
 		if err != nil {
@@ -85,10 +90,68 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 			return ocispec.Descriptor{}, err
 		}
 		desc := ocispec.Descriptor{MediaType: string(mt), Digest: digest.Digest(d.String()), Size: sz}
-		if err := writeLayerIfMissing(ctx, store, desc, l, copyBuf, i, len(layers)); err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("layer %d ingest failed: %w", i, err)
+		tasks = append(tasks, task{index: i, desc: desc, layer: l})
+	}
+	total := len(tasks)
+	if total > 0 {
+		if layerWorkers < 1 {
+			layerWorkers = 1
 		}
-		layerDescs = append(layerDescs, desc)
+		if layerWorkers == 1 {
+			// Sequential with reusable buffer
+			copyBuf := make([]byte, 4<<20) // 4 MiB
+			for _, t := range tasks {
+				if err := writeLayerIfMissing(ctx, store, t.desc, t.layer, copyBuf, t.index, total); err != nil {
+					return ocispec.Descriptor{}, fmt.Errorf("layer %d ingest failed: %w", t.index, err)
+				}
+			}
+		} else {
+			// Concurrent with worker-local buffers
+			jobs := make(chan task)
+			errCh := make(chan error, 1)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			var wg sync.WaitGroup
+			spawn := layerWorkers
+			if spawn > total {
+				spawn = total
+			}
+			for w := 0; w < spawn; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					localBuf := make([]byte, 4<<20) // 4 MiB
+					for t := range jobs {
+						if ctx.Err() != nil {
+							return
+						}
+						if err := writeLayerIfMissing(ctx, store, t.desc, t.layer, localBuf, t.index, total); err != nil {
+							select {
+							case errCh <- fmt.Errorf("layer %d ingest failed: %w", t.index, err):
+							default:
+							}
+							cancel()
+							return
+						}
+					}
+				}()
+			}
+		Enqueue:
+			for _, t := range tasks {
+				select {
+				case <-ctx.Done():
+					break Enqueue
+				case jobs <- t:
+				}
+			}
+			close(jobs)
+			wg.Wait()
+			select {
+			case err := <-errCh:
+				return ocispec.Descriptor{}, err
+			default:
+			}
+		}
 	}
 
 	// Write manifest

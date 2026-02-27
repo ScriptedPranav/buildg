@@ -322,6 +322,13 @@ func newImageImportCommand() cli.Command {
 		Usage:     "Import an image from Docker daemon into buildg cache (no registry)",
 		UsageText: "image import <ref>",
 		Action:    imageImportAction,
+		Flags: []cli.Flag{
+			cli.IntFlag{
+				Name:  "layer-workers",
+				Usage: "Number of concurrent layer imports (default 1 = sequential)",
+				Value: 1,
+			},
+		},
 	}
 }
 
@@ -356,7 +363,7 @@ func imageImportAction(clicontext *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	manifestDesc, err := importerdaemon.ImportImage(ctx, store, lm, ref)
+	manifestDesc, err := importerdaemon.ImportImage(ctx, store, lm, ref, clicontext.Int("layer-workers"))
 	if err != nil {
 		return err
 	}
