@@ -1,7 +1,19 @@
-FROM golang:1.24.9-jammy-rfcurated
+FROM rfubu:22.04-scratch-rfcurated
 
 RUN apt update
 
 RUN apt install -y build-essential
 
 RUN cd /etc/apt
+
+# continue -> next breakpoint
+# next -> next line of dockerfile
+# exec -> shell into container
+
+# extension
+# performance improvement, multi image import, reverse debugging, revoke, recording of logging
+# immediately needed
+# logging for import 
+# get_df_dep.sh | xargs buildg import rfubu scratch , rfubu, 
+
+# container -> writable layer on top of readonly

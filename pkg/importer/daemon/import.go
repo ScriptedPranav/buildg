@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/leases"
@@ -16,6 +17,7 @@ import (
 	crtypes "github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/sirupsen/logrus"
 )
 
 // ImportImage streams an image that exists in the local Docker daemon into the
@@ -65,7 +67,10 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	var layerDescs []ocispec.Descriptor
+	// Preallocate to avoid re-allocations while appending
+	layerDescs := make([]ocispec.Descriptor, 0, len(layers))
+	// Reusable buffer for streaming compressed layers to reduce syscall overhead
+	copyBuf := make([]byte, 4<<20) // 4 MiB
 	for i, l := range layers {
 		d, err := l.Digest()
 		if err != nil {
@@ -80,7 +85,7 @@ func ImportImage(ctx context.Context, store content.Store, lm leases.Manager, re
 			return ocispec.Descriptor{}, err
 		}
 		desc := ocispec.Descriptor{MediaType: string(mt), Digest: digest.Digest(d.String()), Size: sz}
-		if err := writeLayerIfMissing(ctx, store, desc, l); err != nil {
+		if err := writeLayerIfMissing(ctx, store, desc, l, copyBuf, i, len(layers)); err != nil {
 			return ocispec.Descriptor{}, fmt.Errorf("layer %d ingest failed: %w", i, err)
 		}
 		layerDescs = append(layerDescs, desc)
@@ -127,10 +132,13 @@ func writeBytesIfMissing(ctx context.Context, store content.Store, desc ocispec.
 	return nil
 }
 
-func writeLayerIfMissing(ctx context.Context, store content.Store, desc ocispec.Descriptor, l v1.Layer) error {
+func writeLayerIfMissing(ctx context.Context, store content.Store, desc ocispec.Descriptor, l v1.Layer, buf []byte, idx int, total int) error {
 	if _, err := store.Info(ctx, desc.Digest); err == nil {
+		logrus.Debugf("skip layer %d/%d %s (already present)", idx+1, total, shortDigest(desc.Digest.Encoded()))
 		return nil
 	}
+	start := time.Now()
+	logrus.Debugf("importing layer %d/%d %s size=%.2fMB", idx+1, total, shortDigest(desc.Digest.Encoded()), bytesToMiB(desc.Size))
 	rc, err := l.Compressed()
 	if err != nil {
 		return err
@@ -141,7 +149,7 @@ func writeLayerIfMissing(ctx context.Context, store content.Store, desc ocispec.
 		return err
 	}
 	defer w.Close()
-	if _, err := io.Copy(w, rc); err != nil {
+	if _, err := io.CopyBuffer(w, rc, buf); err != nil {
 		return err
 	}
 	if err := w.Commit(ctx, desc.Size, desc.Digest); err != nil {
@@ -149,5 +157,31 @@ func writeLayerIfMissing(ctx context.Context, store content.Store, desc ocispec.
 			return err
 		}
 	}
+	elapsed := time.Since(start)
+	throughput := float64(0)
+	if desc.Size > 0 && elapsed > 0 {
+		throughput = bytesToMiB(desc.Size) / elapsed.Seconds()
+	}
+	logrus.Debugf("imported  layer %d/%d %s in %s (%.2f MB/s)", idx+1, total, shortDigest(desc.Digest.Encoded()), elapsed.Truncate(10*time.Millisecond), throughput)
 	return nil
+}
+
+func shortDigest(encoded string) string {
+	// encoded is usually like "sha256:abcdef..."
+	const shortLen = 12
+	if i := strings.IndexByte(encoded, ':'); i >= 0 && i+1 < len(encoded) {
+		hex := encoded[i+1:]
+		if len(hex) > shortLen {
+			return hex[:shortLen]
+		}
+		return hex
+	}
+	if len(encoded) > shortLen {
+		return encoded[:shortLen]
+	}
+	return encoded
+}
+
+func bytesToMiB(n int64) float64 {
+	return float64(n) / (1024.0 * 1024.0)
 }

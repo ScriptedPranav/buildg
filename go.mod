@@ -9,6 +9,8 @@ require (
 	github.com/containerd/containerd/v2 v2.0.5
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/fifo v1.1.0
+	github.com/containerd/log v0.1.0
+	github.com/distribution/reference v0.6.0
 	github.com/docker/cli v28.2.2+incompatible
 	github.com/google/go-containerregistry v0.20.6
 	github.com/google/go-dap v0.12.0
@@ -40,7 +42,6 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/go-cni v1.1.12 // indirect
 	github.com/containerd/go-runc v1.1.0 // indirect
-	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/nydus-snapshotter v0.15.0 // indirect
 	github.com/containerd/platforms v1.0.0-rc.1 // indirect
 	github.com/containerd/stargz-snapshotter/estargz v0.16.3 // indirect
@@ -49,7 +50,6 @@ require (
 	github.com/containernetworking/cni v1.2.3 // indirect
 	github.com/containernetworking/plugins v1.5.1 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
-	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/docker v28.2.2+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.3 // indirect
 	github.com/docker/go-connections v0.5.0 // indirect
