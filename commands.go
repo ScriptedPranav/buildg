@@ -30,6 +30,9 @@ type handlerContext struct {
 	progress         *progressWriter
 	targetBreakpoint string
 	err              error
+	// selection state shared across commands within a single pause
+	selectionIdx    *int
+	selectionActive *bool
 }
 
 type handlerCommandFn func(ctx context.Context, hCtx *handlerContext) cli.Command
@@ -40,6 +43,7 @@ var handlerCommands = []handlerCommandFn{
 	clearCommand,
 	clearAllCommand,
 	nextCommand,
+	prevCommand,
 	continueCommand,
 	execCommand,
 	listCommand,
@@ -54,6 +58,9 @@ type commandHandler struct {
 	prompt           string
 	signalHandler    *signalHandler
 	targetBreakpoint string
+	// selection state for "inspection-only navigation" (e.g., prev)
+	selectionIdx    int
+	selectionActive bool
 }
 
 func newCommandHandler(stdin *sharedReader, stdout io.Writer, sig *signalHandler) *commandHandler {
@@ -88,6 +95,9 @@ func (h *commandHandler) breakHandler(ctx context.Context, bCtx buildkit.BreakCo
 		}
 	}
 	h.targetBreakpoint = "" // hit the breakpoint so reset it.
+	// reset selection for this pause: default to latest history, inactive
+	h.selectionActive = false
+	h.selectionIdx = bCtx.Handler.HistoryLen() - 1
 	printLines(bCtx.Handler, h.stdout, bCtx.Locs, defaultListRange, defaultListRange, false)
 	for {
 		ln, err := h.readLine(ctx)
@@ -110,7 +120,7 @@ func (h *commandHandler) breakHandler(ctx context.Context, bCtx buildkit.BreakCo
 }
 
 func (h *commandHandler) readLine(ctx context.Context) (string, error) {
-	fmt.Fprintf(h.stdout, h.prompt)
+	fmt.Fprint(h.stdout, h.prompt)
 	r, done := h.stdin.use()
 	defer done()
 	lnCh := make(chan string)
@@ -160,6 +170,15 @@ func (h *commandHandler) dispatch(ctx context.Context, bCtx buildkit.BreakContex
 		continueRead:  true,
 		progress:      progress,
 		err:           nil,
+	}
+	// carry selection state across commands
+	hCtx.selectionIdx = &h.selectionIdx
+	hCtx.selectionActive = &h.selectionActive
+	if h.selectionActive {
+		if info, locs, ok := hCtx.handler.HistoryAt(h.selectionIdx); ok {
+			hCtx.info = info
+			hCtx.locs = locs
+		}
 	}
 	for _, fn := range handlerCommands {
 		app.Commands = append(app.Commands, fn(ctx, hCtx))

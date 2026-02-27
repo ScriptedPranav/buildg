@@ -136,3 +136,34 @@ Use "breakpoints" command to list all registered breakpoints.
 		},
 	}
 }
+
+func prevCommand(_ context.Context, hCtx *handlerContext) cli.Command {
+	return cli.Command{
+		Name:      "prev",
+		Aliases:   []string{},
+		Usage:     "Move to the previous paused step for inspection",
+		UsageText: "prev",
+		Action: func(clicontext *cli.Context) error {
+			if hCtx.selectionIdx == nil || hCtx.selectionActive == nil {
+				return nil
+			}
+			// Activate selection mode if not already active
+			if !*hCtx.selectionActive {
+				*hCtx.selectionActive = true
+			}
+			// Step back if possible
+			if *hCtx.selectionIdx <= 0 {
+				fmt.Fprintln(hCtx.stdout, "No previous step")
+				return nil
+			}
+			*hCtx.selectionIdx = *hCtx.selectionIdx - 1
+			if info, locs, ok := hCtx.handler.HistoryAt(*hCtx.selectionIdx); ok {
+				hCtx.info = info
+				hCtx.locs = locs
+				// Show the selected location context
+				printLines(hCtx.handler, hCtx.stdout, hCtx.locs, defaultListRange, defaultListRange, false)
+			}
+			return nil
+		},
+	}
+}

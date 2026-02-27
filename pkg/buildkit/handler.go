@@ -85,6 +85,15 @@ type Handler struct {
 	imageMu sync.Mutex
 
 	breakpointHandler BreakpointHandler
+
+	// history keeps track of previously paused statuses to allow
+	// inspection of earlier vertices (e.g., via "prev" command).
+	history []historyEntry
+}
+
+type historyEntry struct {
+	info *RegisteredStatus
+	locs []*Location
 }
 
 func (h *Handler) Breakpoints() *Breakpoints {
@@ -108,6 +117,12 @@ func (h *Handler) BreakEachVertex(b bool) {
 func (h *Handler) handle(ctx context.Context, info *RegisteredStatus, locs []*Location) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Record history for inspection commands (e.g., "prev").
+	h.history = append(h.history, historyEntry{
+		info: info,
+		locs: locs,
+	})
 
 	if len(locs) == 0 {
 		logrus.Warnf("no location info: %v", locs)
@@ -141,4 +156,19 @@ func getHitBreakpoints(ctx context.Context, b *Breakpoints, info *RegisteredStat
 		return true
 	})
 	return
+}
+
+// HistoryLen returns the number of recorded paused statuses.
+func (h *Handler) HistoryLen() int {
+	return len(h.history)
+}
+
+// HistoryAt returns the recorded status and locations at the specified index.
+// ok is false if the index is out of range.
+func (h *Handler) HistoryAt(i int) (info *RegisteredStatus, locs []*Location, ok bool) {
+	if i < 0 || i >= len(h.history) {
+		return nil, nil, false
+	}
+	e := h.history[i]
+	return e.info, e.locs, true
 }
