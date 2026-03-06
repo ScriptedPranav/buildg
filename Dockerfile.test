@@ -1,4 +1,4 @@
-FROM apache/spark:3.5.6-python3.11-jammy-fips-rfcurated
+FROM apache/tomcat:9.0.108-jdk21-ubi9-rfcurated      
 
 USER 0 
 RUN apt update

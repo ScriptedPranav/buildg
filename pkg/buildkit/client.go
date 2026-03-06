@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
-	"github.com/containerd/containerd/v2/core/leases"
 	ctrimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	ctdsnapshots "github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/plugins/snapshots/native"
 	"github.com/containerd/containerd/v2/plugins/snapshots/overlay"
 	"github.com/containerd/containerd/v2/plugins/snapshots/overlay/overlayutils"
+	filestore "github.com/ktock/buildg/pkg/imagestore/filestore"
 	"github.com/moby/buildkit/cache/remotecache"
 	localremotecache "github.com/moby/buildkit/cache/remotecache/local"
 	registryremotecache "github.com/moby/buildkit/cache/remotecache/registry"
@@ -40,7 +41,6 @@ import (
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/runc"
-	filestore "github.com/ktock/buildg/pkg/imagestore/filestore"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -375,23 +375,31 @@ func newWorker(ctx context.Context, cfg *config.Config) (worker.Worker, docker.R
 			BinaryDir:  cfg.Workers.OCI.CNIBinaryPath,
 		},
 	}
-    opt, err := runc.NewWorkerOpt(root, snFactory, rootless, oci.ProcessSandbox, nil, nil, nc, nil, "", "", false, nil, "", "", nil)
+	opt, err := runc.NewWorkerOpt(root, snFactory, rootless, oci.ProcessSandbox, nil, nil, nc, nil, "", "", false, nil, "", "", nil)
 	if err != nil {
 		return nil, nil, err
 	}
-    // Provide a lightweight local image store so resolver can prefer local tags
-    // and avoid hitting registries when content is already imported.
-    imgStorePath := filepath.Join(root, "runc-"+snName, "imagestore.json")
-    if is, err := filestore.New(imgStorePath); err != nil {
-        logrus.WithError(err).Warnf("failed to init local image store at %q", imgStorePath)
-    } else {
-        opt.ImageStore = is
-    }
+	// Provide a lightweight local image store so resolver can prefer local tags
+	// and avoid hitting registries when content is already imported. Wrap it
+	// to auto-import from Docker daemon on a miss for convenience.
+	imgStorePath := filepath.Join(root, "runc-"+snName, "imagestore.json")
+	var ai *autoImportImageStore
+	if is, err := filestore.New(imgStorePath); err != nil {
+		logrus.WithError(err).Warnf("failed to init local image store at %q", imgStorePath)
+	} else {
+		// Keep a reference so we can inject stores after worker creation.
+		ai = newAutoImportImageStore(is, cfg).(*autoImportImageStore)
+		opt.ImageStore = ai
+	}
 	resolverFunc := resolver.NewRegistryConfig(cfg.Registries)
 	opt.RegistryHosts = resolverFunc
 	w, err := base.NewWorker(ctx, opt)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Now that worker is created, wire content/lease stores into the wrapper.
+	if ai != nil {
+		ai.setStores(w.ContentStore(), w.LeaseManager())
 	}
 	return w, resolverFunc, nil
 }
@@ -410,20 +418,20 @@ func OpenStores(ctx context.Context, cfg *config.Config) (content.Store, leases.
 // OpenImageStore returns the lightweight local image store used by the worker
 // for resolving image names to descriptors.
 func OpenImageStore(cfg *config.Config) (ctrimages.Store, error) {
-    root := cfg.Root
-    if root == "" {
-        return nil, fmt.Errorf("root directory must be specified")
-    }
-    snName := cfg.Workers.OCI.Snapshotter
-    if snName == "auto" {
-        if err := overlayutils.Supported(root); err == nil {
-            snName = "overlayfs"
-        } else {
-            snName = "native"
-        }
-    }
-    p := filepath.Join(root, "runc-"+snName, "imagestore.json")
-    return filestore.New(p)
+	root := cfg.Root
+	if root == "" {
+		return nil, fmt.Errorf("root directory must be specified")
+	}
+	snName := cfg.Workers.OCI.Snapshotter
+	if snName == "auto" {
+		if err := overlayutils.Supported(root); err == nil {
+			snName = "overlayfs"
+		} else {
+			snName = "native"
+		}
+	}
+	p := filepath.Join(root, "runc-"+snName, "imagestore.json")
+	return filestore.New(p)
 }
 
 func newPipeListener() *pipeListener {
